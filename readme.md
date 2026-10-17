@@ -113,6 +113,12 @@ predictions, and writes aggregate metrics beside them as `*.summary.json`.
 Use `--max-samples` for a smoke test and `--load-in-4bit` for local CUDA inference
 (the latter additionally requires `bitsandbytes`).
 
+For the reproducible Slurm array that evaluates Qwen, Gemma, and Llama on the
+complete NLI, sentiment, LID, POS, DEPS, and WSD test sets, see
+[`OPEN_WEIGHT_FULL_EVAL.md`](OPEN_WEIGHT_FULL_EVAL.md). The job validates the
+expected row count before loading a model and records the input SHA-256 in each
+summary. LAJ uses the separate pairwise protocol documented above.
+
 | Model family | Evaluation route |
 |---|---|
 | mBERT, XLM-R-base | `run.py` for supervised tasks; `data/wsd/evaluate_wsd.py` for WSD |

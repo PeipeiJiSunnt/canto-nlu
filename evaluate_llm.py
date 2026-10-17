@@ -8,6 +8,7 @@ share the same task prompts, parsers, and metrics so results remain comparable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -24,7 +25,7 @@ from typing import Any
 LABELS = {
     "nli": ("entailment", "not_entailment"),
     "sentiment": ("smile", "ok", "cry"),
-    "ld": ("cantonese", "mandarin", "mixed"),
+    "ld": ("cantonese", "mandarin", "other"),
     "laj": ("unacceptable", "acceptable"),
     "wsd": ("similar", "not_similar"),
 }
@@ -33,15 +34,15 @@ POS_TAGS = (
     "NUM", "PART", "PRON", "PROPN", "PUNCT", "SCONJ", "VERB",
 )
 DEFAULT_DATA = {
-    "nli": Path("data/nli/sample_nli.jsonl"),
+    "nli": Path("data/nli/full_test.jsonl"),
     "sentiment": Path("data/sentiment/test.jsonl"),
-    "ld": Path("data/ld/ld_test.jsonl"),
+    "ld": Path("data/ld/lid_test.jsonl"),
     "laj": Path("data/laj/laj_finetune/finetune_test.jsonl"),
     "pos": Path("data/pos/pos_test.jsonl"),
     "deps": Path("data/deps/deps_test.jsonl"),
     "wsd": Path("data/wsd/test.jsonl"),
 }
-LD_LABELS = {0: "cantonese", 1: "mandarin", 2: "mixed"}
+LD_LABELS = {0: "cantonese", 1: "mandarin", 2: "other"}
 LAJ_LABELS = {0: "unacceptable", 1: "acceptable"}
 
 
@@ -53,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", type=Path, help="Defaults to the task test file under data/")
     parser.add_argument("--output", type=Path, required=True, help="Prediction JSONL path")
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument(
+        "--expected-samples",
+        type=int,
+        help="Abort unless the selected input contains exactly this many examples.",
+    )
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument(
         "--max-new-tokens",
@@ -142,8 +148,9 @@ smile：整體正面；ok：整體中性或正負混合；cry：整體負面。
 標籤："""
     if task == "ld":
         return f"""判斷句子的語言類型。
-cantonese：香港粵語；mandarin：標準書面漢語；mixed：兩者混合。
-繁簡字不是判斷標準。只輸出 cantonese、mandarin 或 mixed，不要解釋。
+cantonese：只含粵語特徵；mandarin：只含普通話／標準書面漢語特徵；
+other：同時含粵語與普通話特徵，或不含任何一方的專屬特徵。
+繁簡字不是判斷標準。只輸出 cantonese、mandarin 或 other，不要解釋。
 
 句子：{row['sentence']}
 標籤："""
@@ -431,11 +438,64 @@ def read_completed(path: Path) -> dict[str, dict[str, Any]]:
     completed = {}
     if path.exists():
         with path.open(encoding="utf-8") as stream:
-            for line in stream:
+            for line_number, line in enumerate(stream, 1):
                 if line.strip():
                     record = json.loads(line)
-                    completed[str(record["id"])] = record
+                    record_id = str(record["id"])
+                    if record_id in completed:
+                        raise ValueError(
+                            f"Duplicate prediction id {record_id!r} at {path}:{line_number}"
+                        )
+                    completed[record_id] = record
     return completed
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prepare_run_metadata(
+    args: argparse.Namespace, data_path: Path, data_sha256: str
+) -> Path:
+    run_path = args.output.with_suffix(".run.json")
+    config = {
+        "task": args.task,
+        "model": args.model,
+        "backend": args.backend,
+        "data": str(data_path),
+        "data_sha256": data_sha256,
+        "expected_samples": args.expected_samples,
+        "seed": args.seed,
+        "max_input_tokens": args.max_input_tokens,
+        "max_new_tokens": args.max_new_tokens,
+        "load_in_4bit": args.load_in_4bit,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.resume and args.output.exists():
+        if not run_path.exists():
+            raise SystemExit(
+                f"Cannot safely resume {args.output}: missing run metadata {run_path}."
+            )
+        previous = json.loads(run_path.read_text(encoding="utf-8"))
+        if previous != config:
+            changed = sorted(
+                key for key in set(previous) | set(config)
+                if previous.get(key) != config.get(key)
+            )
+            raise SystemExit(
+                f"Cannot resume {args.output}: run configuration changed: "
+                + ", ".join(changed)
+            )
+    else:
+        run_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return run_path
 
 
 def main() -> None:
@@ -447,9 +507,29 @@ def main() -> None:
     random.seed(args.seed)
     data_path = args.data or DEFAULT_DATA[args.task]
     rows = read_rows(data_path, args.task, args.max_samples)
-    dep_labels = tuple(sorted({label for row in rows for label in row.get("deprels", [])}))
+    if args.expected_samples is not None and len(rows) != args.expected_samples:
+        raise SystemExit(
+            f"Expected {args.expected_samples} examples in {data_path}, found {len(rows)}. "
+            "Refusing to run a partial or unexpected test set."
+        )
+    data_sha256 = sha256_file(data_path)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    run_path = prepare_run_metadata(args, data_path, data_sha256)
+    dep_labels = tuple(sorted({label for row in rows for label in row.get("deprels", [])}))
     completed = read_completed(args.output) if args.resume else {}
+    row_by_id = {row["id"]: row for row in rows}
+    unexpected_ids = sorted(set(completed) - set(row_by_id))
+    if unexpected_ids:
+        raise SystemExit(
+            f"Cannot resume {args.output}: predictions contain IDs not in the test set: "
+            + ", ".join(unexpected_ids[:10])
+        )
+    for record_id, record in completed.items():
+        expected_gold = gold_value(row_by_id[record_id], args.task)
+        if record.get("gold") != expected_gold:
+            raise SystemExit(
+                f"Cannot resume {args.output}: gold value changed for id {record_id}."
+            )
     mode = "a" if args.resume and args.output.exists() else "w"
 
     if args.backend == "local":
@@ -496,11 +576,15 @@ def main() -> None:
         "model": args.model,
         "backend": args.backend,
         "data": str(data_path),
+        "data_sha256": data_sha256,
+        "expected_samples": args.expected_samples,
         "setting": "zero-shot-greedy",
+        "load_in_4bit": args.load_in_4bit,
         "seed": args.seed,
         "samples_generated_this_invocation": generated,
         "wall_time_seconds_this_invocation": time.perf_counter() - started,
         "finished_utc": datetime.now(timezone.utc).isoformat(),
+        "run_metadata": str(run_path),
         **summarize(selected, args.task),
     }
     summary_path = args.output.with_suffix(".summary.json")
